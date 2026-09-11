@@ -30,7 +30,7 @@ The plugin saves the current brightness when the idle timeout is reached, sets t
 
 * [Omarchy](https://omarchy.org/)
 * Quickshell
-* `brightnessctl`
+* `brightnessctl` at `/usr/bin/brightnessctl`
 * An ASUS keyboard backlight exposed through the Linux LED subsystem
 
 The plugin looks for an LED matching:
@@ -113,7 +113,13 @@ The following values are accepted:
 
 Missing, malformed, non-integer, zero, negative, or out-of-range values fall back to the 30-second default.
 
-The configuration file is watched for changes. If a configuration change does not take effect immediately, restart the Omarchy shell:
+### Configuration file safety
+
+For safety, the plugin accepts the configuration only when it is a regular file owned by the user running the shell and is not writable by group or other users. Symlinks, inaccessible files, and files larger than 4096 bytes are rejected. Invalid or unsafe configuration always falls back to the 30-second default.
+
+The file is read in a bounded operation before JSON is parsed. The validated timeout is applied before the native idle monitor is created, and configuration changes are re-read while the plugin is running.
+
+If a configuration change does not take effect immediately, restart the Omarchy shell:
 
 ```bash
 omarchy restart shell
@@ -122,6 +128,8 @@ omarchy restart shell
 ## How it works
 
 The plugin monitors user idle state through Quickshell's native Wayland idle monitoring.
+
+It reads the keyboard LED's current and maximum brightness directly from sysfs, then invokes `/usr/bin/brightnessctl` only to change the keyboard backlight. Every helper process has a short deadline and is terminated, then killed if necessary.
 
 When the configured idle timeout is reached:
 
@@ -165,13 +173,13 @@ asus::kbd_backlight
 Check the current brightness:
 
 ```bash
-cat /sys/class/leds/asus::kbd_backlight/brightness
+/usr/bin/cat /sys/class/leds/asus::kbd_backlight/brightness
 ```
 
 Check the maximum brightness supported by the hardware:
 
 ```bash
-cat /sys/class/leds/asus::kbd_backlight/max_brightness
+/usr/bin/cat /sys/class/leds/asus::kbd_backlight/max_brightness
 ```
 
 Check whether `brightnessctl` is installed:
@@ -187,6 +195,14 @@ omarchy-shell shell listPlugins
 ```
 
 If the ASUS keyboard LED is not present under `/sys/class/leds/`, this plugin cannot control the keyboard backlight on that system.
+
+For runtime diagnostics, inspect the Quickshell log for messages beginning with:
+
+```text
+omarchy asus-kbd-backlight:
+```
+
+Normal startup reports configuration loading, LED detection, the detected maximum brightness, and IdleMonitor activation. Idle transitions report the saved brightness, keyboard-off action, and restored brightness.
 
 ## Uninstall
 

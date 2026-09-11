@@ -3,7 +3,7 @@
   "id": "asus-kbd-backlight",
   "name": "ASUS Keyboard Backlight Idle",
   "version": "1.0.0",
-  "author": "Local user plugin",
+  "author": "Abhishek Adhikari",
   "description": "Turns the ASUS keyboard backlight off after independent idle time and restores its prior level on activity.",
   "kinds": [
     "service"
