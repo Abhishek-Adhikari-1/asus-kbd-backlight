@@ -25,7 +25,6 @@ Item {
     property bool restoreAfterOff: false
     property bool unavailableLogged: false
     property bool configErrorLogged: false
-    property bool configMetadataValid: false
     property bool idleMonitorReady: false
     property bool idleMonitorRecreating: false
     property QtObject idleMonitorObject: null
@@ -99,22 +98,17 @@ Item {
     }
 
     function beginConfigLoad() {
-        configMetadataValid = false;
-        if (!userId || configStat.running || configReader.running)
+        if (!userId || configReader.running)
             return ;
 
         log("checking configuration");
-        configStat.running = true;
+        configReader.command = configReaderCommand();
+        configReader.running = true;
     }
 
-    function configMetadataIsSafe(line) {
-        var fields = String(line).trim().split("|");
-        if (fields.length !== 4 || fields[0] !== "regular file" || fields[1] !== userId || !/^[0-7]{3,4}$/.test(fields[2]) || !/^[0-9]+$/.test(fields[3]))
-            return false;
-
-        var mode = parseInt(fields[2], 8);
-        var size = Number(fields[3]);
-        return (mode & 18) === 0 && validInteger(size) && size >= 0 && size <= maximumConfigBytes;
+    // The helper retains the descriptor it validates, avoiding a pathname check/use race.
+    function configReaderCommand() {
+        return ["/usr/bin/python3", "-c", "import os, stat, sys\n" + "path, uid, limit = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])\n" + "directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC\n" + "file_flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC\n" + "directory_fd = None\n" + "file_fd = None\n" + "try:\n" + "    parts = path.split('/')\n" + "    if not path.startswith('/') or not parts[-1]: raise ValueError\n" + "    directory_fd = os.open('/', directory_flags)\n" + "    for part in parts[1:-1]:\n" + "        if not part or part in ('.', '..'): raise ValueError\n" + "        next_fd = os.open(part, directory_flags, dir_fd=directory_fd)\n" + "        os.close(directory_fd)\n" + "        directory_fd = next_fd\n" + "    file_fd = os.open(parts[-1], file_flags, dir_fd=directory_fd)\n" + "    metadata = os.fstat(file_fd)\n" + "    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != uid or metadata.st_mode & 0o022 or metadata.st_size > limit: raise ValueError\n" + "    content = b''\n" + "    while len(content) < limit:\n" + "        chunk = os.read(file_fd, limit - len(content))\n" + "        if not chunk: break\n" + "        content += chunk\n" + "    sys.stdout.buffer.write(content)\n" + "except (OSError, ValueError):\n" + "    sys.exit(1)\n" + "finally:\n" + "    if file_fd is not None: os.close(file_fd)\n" + "    if directory_fd is not None: os.close(directory_fd)\n", configPath, userId, String(maximumConfigBytes)];
     }
 
     function handleIdleStateChange() {
@@ -297,55 +291,9 @@ Item {
     }
 
     Process {
-        id: configStat
-
-        command: ["/usr/bin/stat", "--format=%F|%u|%a|%s", "--", root.configPath]
-        onRunningChanged: {
-            if (running) {
-                configStatDeadline.restart();
-            } else {
-                configStatDeadline.stop();
-                configStatKillGrace.stop();
-            }
-        }
-        onExited: function(code) {
-            if (code !== 0 || !root.configMetadataValid)
-                root.useDefaultConfig();
-            else
-                configReader.running = true;
-        }
-
-        stdout: SplitParser {
-            onRead: function(line) {
-                root.configMetadataValid = root.configMetadataIsSafe(line);
-            }
-        }
-
-    }
-
-    Timer {
-        id: configStatDeadline
-
-        interval: root.processDeadlineMs
-        onTriggered: {
-            if (configStat.running) {
-                configStat.signal(15);
-                configStatKillGrace.restart();
-            }
-        }
-    }
-
-    Timer {
-        id: configStatKillGrace
-
-        interval: root.processKillGraceMs
-        onTriggered: root.stopProcess(configStat, configStatDeadline, configStatKillGrace)
-    }
-
-    Process {
         id: configReader
 
-        command: ["/usr/bin/dd", "if=" + root.configPath, "iflag=nofollow", "bs=1", "count=" + root.maximumConfigBytes, "status=none"]
+        command: []
         onRunningChanged: {
             if (running) {
                 configReaderDeadline.restart();

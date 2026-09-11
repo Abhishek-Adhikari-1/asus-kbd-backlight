@@ -117,7 +117,7 @@ Missing, malformed, non-integer, zero, negative, or out-of-range values fall bac
 
 For safety, the plugin accepts the configuration only when it is a regular file owned by the user running the shell and is not writable by group or other users. Symlinks, inaccessible files, and files larger than 4096 bytes are rejected. Invalid or unsafe configuration always falls back to the 30-second default.
 
-The file is read in a bounded operation before JSON is parsed. The validated timeout is applied before the native idle monitor is created, and configuration changes are re-read while the plugin is running.
+The file is read in a bounded operation before JSON is parsed. Its directory chain is opened without following symlinks, and its type, owner, permissions, and size are verified on the same retained file descriptor that is read. This prevents a configuration-file swap between validation and use. The validated timeout is applied before the native idle monitor is created, and configuration changes are re-read while the plugin is running.
 
 If a configuration change does not take effect immediately, restart the Omarchy shell:
 
