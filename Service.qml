@@ -22,6 +22,30 @@ Item {
     property int maximumBrightness: -1
     property int savedBrightness: -1
     property bool readPending: false
+
+    // ---- Restart and hibernate recovery -------------------------------------
+    // The level a restore will use lives in memory, which a shell restart
+    // throws away — as does Omarchy's hibernate hook, which writes 0 without
+    // telling anyone. Either way the keyboard is left dark with nothing to
+    // restore it from. The pending level is therefore also written to a state
+    // file that outlives the shell, and read back at startup while the LED is
+    // off and the record is still fresh.
+    readonly property int defaultRestoreGraceSeconds: 43200
+    readonly property int maximumRestoreGraceSeconds: 604800
+    readonly property string runtimeDirectory: Quickshell.env("XDG_RUNTIME_DIR")
+    // The runtime directory is what survives a restart and a resume but not a
+    // logout: a level remembered for a machine nobody is logged into is not
+    // this plugin's business.
+    readonly property string statePath: runtimeDirectory !== "" ? runtimeDirectory + "/omarchy-asus-kbd-backlight.json" : ""
+    property int restoreGraceSeconds: defaultRestoreGraceSeconds
+    property double recoveredBrightness: 0
+    property double recoveredSavedAt: 0
+    property bool stateReadPending: false
+    property bool startupLedReadPending: false
+    property bool startupRecoveryDone: false
+    property bool stateErrorLogged: false
+    property bool statePersistenceLogged: false
+
     property bool restoreAfterOff: false
     property bool unavailableLogged: false
     property bool configErrorLogged: false
@@ -56,16 +80,40 @@ Item {
     }
 
     function loadConfig(text) {
+        var parsed = null;
         try {
-            var value = JSON.parse(text).idleTimeoutSeconds;
-            if (!validInteger(value) || value < minimumIdleTimeoutSeconds || value > maximumIdleTimeoutSeconds)
-                throw new Error("out of range");
-
-            applyIdleTimeout(value);
-            configErrorLogged = false;
-            log("configuration loaded; idle timeout " + value + "s");
+            parsed = JSON.parse(text);
         } catch (error) {
+            parsed = null;
+        }
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
             useDefaultConfig();
+            return;
+        }
+
+        // The two settings are read one at a time: a value this version does
+        // not know, or one that is out of range, must not drag the other back
+        // to its default.
+        var timeout = parsed.idleTimeoutSeconds;
+        if (validInteger(timeout) && timeout >= minimumIdleTimeoutSeconds && timeout <= maximumIdleTimeoutSeconds) {
+            applyIdleTimeout(timeout);
+            configErrorLogged = false;
+            log("configuration loaded; idle timeout " + timeout + "s");
+        } else {
+            useDefaultConfig();
+        }
+
+        var grace = parsed.restoreGraceSeconds;
+        if (grace === undefined) {
+            restoreGraceSeconds = defaultRestoreGraceSeconds;
+        } else if (validInteger(grace) && grace >= 0 && grace <= maximumRestoreGraceSeconds) {
+            restoreGraceSeconds = grace;
+            log(grace > 0
+                ? "recovery after a restart enabled for " + grace + "s"
+                : "recovery after a restart disabled");
+        } else {
+            restoreGraceSeconds = defaultRestoreGraceSeconds;
+            log("invalid restore grace period; using " + defaultRestoreGraceSeconds + "s");
         }
     }
 
@@ -87,6 +135,150 @@ Item {
     function clearSavedState() {
         savedBrightness = -1;
         restoreAfterOff = false;
+        removeStateRecord();
+    }
+
+    // ---- The state record ---------------------------------------------------
+    // Written before the backlight is turned off, so a shell that dies during
+    // the call is still covered, and removed as soon as the level is back or
+    // is known to be beside the point.
+    function stateRecordCommand(mode, level, savedAt) {
+        return ["/usr/bin/python3", "-c",
+            "import json, os, sys\n" +
+            "path, mode = sys.argv[1], sys.argv[2]\n" +
+            "if mode == 'remove':\n" +
+            "    try:\n" +
+            "        os.unlink(path)\n" +
+            "    except FileNotFoundError:\n" +
+            "        pass\n" +
+            "    sys.exit(0)\n" +
+            "record = json.dumps({'brightness': int(sys.argv[3]), 'savedAt': int(sys.argv[4])}).encode()\n" +
+            "flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC\n" +
+            "fd = os.open(path + '.tmp', flags, 0o600)\n" +
+            "try:\n" +
+            "    os.write(fd, record)\n" +
+            "    os.fsync(fd)\n" +
+            "finally:\n" +
+            "    os.close(fd)\n" +
+            "os.replace(path + '.tmp', path)\n",
+            statePath, mode, String(level), String(savedAt)];
+    }
+
+    function logStateError(message) {
+        if (stateErrorLogged)
+            return;
+
+        stateErrorLogged = true;
+        log(message);
+    }
+
+    function writeStateRecord(level) {
+        if (!statePath) {
+            if (!statePersistenceLogged) {
+                statePersistenceLogged = true;
+                log("no runtime directory; a restart may leave the keyboard backlight off");
+            }
+            return;
+        }
+        if (stateWriter.running)
+            return;
+
+        stateWriter.command = stateRecordCommand("write", level, Math.round(Date.now()));
+        stateWriter.running = true;
+    }
+
+    function removeStateRecord() {
+        if (!statePath || stateCleaner.running)
+            return;
+
+        stateCleaner.command = stateRecordCommand("remove", 0, 0);
+        stateCleaner.running = true;
+    }
+
+    // ---- Recovery at startup ------------------------------------------------
+    // Two reads, in this order: the record, then the LED itself. The LED
+    // decides, because a level already on the hardware belongs to whoever put
+    // it there and outranks anything this plugin remembers.
+    function beginStartupRecovery() {
+        if (startupRecoveryDone || startupLedReadPending || maximumBrightness < 1 || !device)
+            return;
+
+        startupRecoveryDone = true;
+        if (!statePath) {
+            if (keyboardIsIdle)
+                handleIdleStateChange();
+            return;
+        }
+
+        stateReadPending = true;
+        stateFile.reload();
+    }
+
+    function readStateRecord(text) {
+        if (!stateReadPending)
+            return;
+
+        stateReadPending = false;
+
+        var record = null;
+        try {
+            record = JSON.parse(text);
+        } catch (error) {
+            record = null;
+        }
+        if (record === null || typeof record !== "object" || Array.isArray(record)) {
+            logStateError("ignoring an unreadable saved brightness");
+            removeStateRecord();
+            return;
+        }
+        if (!validInteger(record.brightness) || record.brightness < 1 || record.brightness > maximumBrightness) {
+            logStateError("ignoring a saved brightness outside the LED's range");
+            removeStateRecord();
+            return;
+        }
+
+        recoveredBrightness = record.brightness;
+        recoveredSavedAt = typeof record.savedAt === "number" && isFinite(record.savedAt) ? record.savedAt : 0;
+
+        startupLedReadPending = true;
+        brightnessFile.reload();
+    }
+
+    function handleStartupLed(text) {
+        if (!startupLedReadPending)
+            return;
+
+        startupLedReadPending = false;
+        decideStartupLed(text);
+        // Recovery has had its say; the ordinary idle behaviour resumes.
+        if (keyboardIsIdle)
+            handleIdleStateChange();
+    }
+
+    function decideStartupLed(text) {
+        var level = parseBrightness(text);
+        // A level that cannot be read is not a level of zero.
+        if (level > 0) {
+            // The hardware holds a level already, so nothing was stranded and
+            // the record has been overtaken by whoever set it.
+            removeStateRecord();
+            return;
+        }
+        if (level !== 0)
+            return;
+
+        var age = Date.now() - recoveredSavedAt;
+        if (restoreGraceSeconds <= 0 || recoveredSavedAt <= 0 || age > restoreGraceSeconds * 1000) {
+            log("discarded a saved brightness from an earlier session");
+            removeStateRecord();
+            return;
+        }
+
+        log("recovering brightness " + recoveredBrightness + " after a restart");
+        savedBrightness = recoveredBrightness;
+        // Idle now: the ordinary restore-on-activity path brings it back.
+        if (!keyboardIsIdle)
+            restore();
     }
 
     function stopProcess(process, deadline, killGrace) {
@@ -114,8 +306,10 @@ Item {
     function handleIdleStateChange() {
         log("idle event received; isIdle=" + keyboardIsIdle);
         if (keyboardIsIdle) {
-            if (!device || maximumBrightness < 1 || savedBrightness >= 0 || readPending)
-                return ;
+            // A recovery read in flight owns the LED for this moment.
+            if (!device || maximumBrightness < 1 || savedBrightness >= 0 || readPending
+                || stateReadPending || startupLedReadPending)
+                return;
 
             readPending = true;
             brightnessFile.reload();
@@ -139,6 +333,9 @@ Item {
 
         savedBrightness = level;
         log("idle timeout reached; saved brightness " + level);
+        // Recorded before the LED is touched: a shell that dies between the
+        // two still leaves enough behind to recover from.
+        writeStateRecord(level);
         keyboardOff.running = true;
     }
 
@@ -185,11 +382,39 @@ Item {
         path: root.brightnessPath
         preload: true
         printErrors: false
-        onLoaded: root.readBrightness(text())
+        onLoaded: {
+            if (root.startupLedReadPending)
+                root.handleStartupLed(text());
+            else
+                root.readBrightness(text());
+        }
         onLoadFailed: {
             if (root.readPending) {
                 root.readPending = false;
                 root.log("failed to read keyboard brightness");
+            }
+            if (root.startupLedReadPending)
+                root.startupLedReadPending = false;
+        }
+    }
+
+    // The record of a level this plugin still owes the keyboard. Its absence is
+    // the ordinary case — a first start, or a clean exit after a restore — and
+    // is not an error.
+    FileView {
+        id: stateFile
+
+        path: root.statePath
+        preload: true
+        printErrors: false
+        onLoaded: root.readStateRecord(text())
+        onLoadFailed: {
+            // The ordinary case: a first start, or a clean exit after a
+            // restore. There is nothing to recover from.
+            if (root.stateReadPending) {
+                root.stateReadPending = false;
+                if (root.keyboardIsIdle && !root.startupLedReadPending)
+                    root.handleIdleStateChange();
             }
         }
     }
@@ -205,8 +430,9 @@ Item {
             if (/^[1-9][0-9]*$/.test(value)) {
                 root.maximumBrightness = Number(value);
                 root.log("using " + root.ledPath + " (max brightness " + value + ")");
-                if (root.keyboardIsIdle)
-                    root.handleIdleStateChange();
+                // Before anything else: a level this plugin still owes the
+                // keyboard from before the shell restarted.
+                root.beginStartupRecovery();
 
             } else {
                 root.log("invalid keyboard max brightness; service disabled");
@@ -471,6 +697,85 @@ Item {
 
         interval: root.processKillGraceMs
         onTriggered: root.stopProcess(keyboardRestore, keyboardRestoreDeadline, keyboardRestoreKillGrace)
+    }
+
+    // The state record itself. A failure here is not something the person at
+    // the keyboard can act on, so it is reported once and the service carries
+    // on with the behaviour it had before the record existed.
+    Process {
+        id: stateWriter
+
+        command: []
+        onRunningChanged: {
+            if (running) {
+                stateWriterDeadline.restart();
+            } else {
+                stateWriterDeadline.stop();
+                stateWriterKillGrace.stop();
+            }
+        }
+        onExited: function(code) {
+            if (code !== 0)
+                root.logStateError("could not record a saved brightness for a restart");
+        }
+
+    }
+
+    Timer {
+        id: stateWriterDeadline
+
+        interval: root.processDeadlineMs
+        onTriggered: {
+            if (stateWriter.running) {
+                stateWriter.signal(15);
+                stateWriterKillGrace.restart();
+            }
+        }
+    }
+
+    Timer {
+        id: stateWriterKillGrace
+
+        interval: root.processKillGraceMs
+        onTriggered: root.stopProcess(stateWriter, stateWriterDeadline, stateWriterKillGrace)
+    }
+
+    Process {
+        id: stateCleaner
+
+        command: []
+        onRunningChanged: {
+            if (running) {
+                stateCleanerDeadline.restart();
+            } else {
+                stateCleanerDeadline.stop();
+                stateCleanerKillGrace.stop();
+            }
+        }
+        onExited: function(code) {
+            if (code !== 0)
+                root.logStateError("could not clear a saved brightness record");
+        }
+
+    }
+
+    Timer {
+        id: stateCleanerDeadline
+
+        interval: root.processDeadlineMs
+        onTriggered: {
+            if (stateCleaner.running) {
+                stateCleaner.signal(15);
+                stateCleanerKillGrace.restart();
+            }
+        }
+    }
+
+    Timer {
+        id: stateCleanerKillGrace
+
+        interval: root.processKillGraceMs
+        onTriggered: root.stopProcess(stateCleaner, stateCleanerDeadline, stateCleanerKillGrace)
     }
 
 }
