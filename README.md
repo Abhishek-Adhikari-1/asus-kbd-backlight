@@ -7,6 +7,7 @@ A lightweight Omarchy user plugin that turns off the ASUS keyboard backlight aft
 * Automatically turns off the ASUS keyboard backlight after inactivity.
 * Restores the exact brightness level that was active before idle.
 * Survives a shell restart or a resume: a pending restore is recorded and recovered at startup, so the keyboard is never left dark with nothing to restore it from.
+* Hands the backlight back when the session locks, so Omarchy's own lock restore returns the level you were using rather than a dimmed zero.
 * Supports any brightness level exposed by the hardware; it does not assume brightness `1` or a maximum of `3`.
 * Configurable idle timeout.
 * Default timeout: **30 seconds**.
@@ -178,6 +179,17 @@ When user activity resumes:
 The plugin does not assume a particular brightness range. It reads the hardware's available brightness values through the Linux LED interface.
 
 If the keyboard backlight was already at `0` when the idle timeout occurred, it remains `0` when activity resumes.
+
+## Coexisting with the session lock
+
+Omarchy's lock manages the keyboard backlight itself while the session is locked: `omarchy-brightness-keyboard off` saves the LED's current level with `brightnessctl` and sets it to `0`, and `omarchy-system-wake` restores that saved level on unlock.
+
+That only returns the level you had if the level it saved is the one you chose. Because this plugin dims the backlight after 30 seconds, the lock would otherwise save a dimmed `0` and faithfully restore it — leaving the keyboard dark after every unlock. So the service:
+
+* hands the backlight back at the level it was holding when the session locks, so the lock's snapshot is the level you were using, and
+* stays out of the way while a lock is up, leaving the LED to the lock.
+
+The lock's state is read from `omarchy-shell lock isLocked` — once a second while a level is held, once every five seconds while a lock is up, and not at all otherwise. Nothing here touches the session-lock protocol itself, so taking and releasing the lock stays entirely the lock's business.
 
 ## Safety and limitations
 

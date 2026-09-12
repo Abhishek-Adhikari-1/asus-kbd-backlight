@@ -46,6 +46,22 @@ Item {
     property bool stateErrorLogged: false
     property bool statePersistenceLogged: false
 
+    // ---- Coexisting with the session lock -----------------------------------
+    // Omarchy's lock blanks the keyboard backlight itself, and in a way that
+    // makes it the owner of the LED while locked: `omarchy-brightness-keyboard
+    // off` saves the LED's current level with brightnessctl and sets 0, and
+    // `omarchy-system-wake` restores that saved value on unlock. The save has
+    // to see the level the person chose, not the one this service dimmed to —
+    // otherwise the wake restores the dimmed 0 and the keyboard stays dark
+    // after every lock. So while a lock is up this service hands the LED back
+    // at the level it was holding, and keeps out of the way until the unlock.
+    readonly property int lockProbeIntervalHoldingMs: 1000
+    readonly property int lockProbeIntervalLockedMs: 5000
+    property bool sessionLocked: false
+    property bool lockProbeErrorLogged: false
+    property string lockProbeAnswer: ""
+    property string restoreReason: "activity resumed"
+
     property bool restoreAfterOff: false
     property bool unavailableLogged: false
     property bool configErrorLogged: false
@@ -278,7 +294,7 @@ Item {
         savedBrightness = recoveredBrightness;
         // Idle now: the ordinary restore-on-activity path brings it back.
         if (!keyboardIsIdle)
-            restore();
+            restore("recovered after a restart");
     }
 
     function stopProcess(process, deadline, killGrace) {
@@ -306,9 +322,10 @@ Item {
     function handleIdleStateChange() {
         log("idle event received; isIdle=" + keyboardIsIdle);
         if (keyboardIsIdle) {
-            // A recovery read in flight owns the LED for this moment.
+            // A recovery read in flight owns the LED for this moment, and so
+            // does the lock: while it is up, its blanking is the dimming.
             if (!device || maximumBrightness < 1 || savedBrightness >= 0 || readPending
-                || stateReadPending || startupLedReadPending)
+                || stateReadPending || startupLedReadPending || sessionLocked)
                 return;
 
             readPending = true;
@@ -339,20 +356,69 @@ Item {
         keyboardOff.running = true;
     }
 
-    function restore() {
+    function restore(reason) {
         if (savedBrightness < 0)
             return ;
 
+        restoreReason = reason || "activity resumed";
+
         if (keyboardOff.running) {
             restoreAfterOff = true;
-            return ;
+            return;
         }
         if (keyboardRestore.running)
-            return ;
+            return;
 
-        log("activity resumed; restoring brightness " + savedBrightness);
+        log(restoreReason + "; restoring brightness " + savedBrightness);
         keyboardRestore.command = ["/usr/bin/brightnessctl", "--device", device, "set", String(savedBrightness)];
         keyboardRestore.running = true;
+    }
+
+    // ---- The session lock ---------------------------------------------------
+    // Asked of the shell, which is the authority on it, and only while this
+    // service is holding a level or a lock is up — nothing is polled during
+    // ordinary use.
+    function pollSessionLock() {
+        if (lockProbe.running)
+            return;
+
+        lockProbe.command = ["/usr/bin/omarchy-shell", "lock", "isLocked"];
+        lockProbe.running = true;
+    }
+
+    function lockProbeFinished(exitCode, text) {
+        if (exitCode !== 0) {
+            if (!lockProbeErrorLogged) {
+                lockProbeErrorLogged = true;
+                log("could not read the session lock state");
+            }
+            return;
+        }
+
+        var answer = String(text).trim();
+        if (answer !== "true" && answer !== "false")
+            return;
+
+        lockProbeErrorLogged = false;
+
+        var locked = answer === "true";
+        if (locked === sessionLocked)
+            return;
+
+        sessionLocked = locked;
+        if (!locked) {
+            log("session unlocked");
+            return;
+        }
+
+        log("session locked");
+        // The lock's own blanking is about to save whatever the LED reads, so
+        // the level this service was holding has to be back on the hardware
+        // before that happens.
+        if (savedBrightness >= 0) {
+            log("handing the backlight back for the lock");
+            restore("session locked");
+        }
     }
 
     onKeyboardIsIdleChanged: {
@@ -634,8 +700,11 @@ Item {
                 root.clearSavedState();
             } else {
                 root.log("keyboard turned off");
+                // Deferred, and with its reason intact: an off that is still
+                // running when a lock arrives hands back the level that lock
+                // was told about, not a fresh "activity resumed".
                 if (!root.keyboardIsIdle || root.restoreAfterOff)
-                    Qt.callLater(root.restore);
+                    Qt.callLater(function() { root.restore(root.restoreReason) });
 
             }
         }
@@ -675,7 +744,7 @@ Item {
             if (code !== 0)
                 root.log("failed to restore keyboard backlight");
             else
-                root.log("activity resumed; restored brightness " + root.savedBrightness);
+                root.log(root.restoreReason + "; restored brightness " + root.savedBrightness);
             root.clearSavedState();
         }
     }
@@ -697,6 +766,72 @@ Item {
 
         interval: root.processKillGraceMs
         onTriggered: root.stopProcess(keyboardRestore, keyboardRestoreDeadline, keyboardRestoreKillGrace)
+    }
+
+    // ---- The lock probe -----------------------------------------------------
+    // Polled only while a level is being held (a lock would then strand it) or
+    // while a lock is up (waiting for the unlock that ends it), so ordinary use
+    // costs nothing. The shell is asked, so the answer is the same one the
+    // lock's own keys off, and nothing here touches the session-lock protocol
+    // the lock itself owns.
+    Timer {
+        id: lockProbeTimer
+
+        // Only while this service is holding a level (a lock would then strand
+        // it) or while a lock is up (waiting for the unlock that ends it).
+        running: root.savedBrightness >= 0 || root.sessionLocked
+        repeat: true
+        interval: root.sessionLocked ? root.lockProbeIntervalLockedMs : root.lockProbeIntervalHoldingMs
+        onTriggered: root.pollSessionLock()
+    }
+
+    Process {
+        id: lockProbe
+
+        // Set when the poll starts, as this service's other helper processes
+        // are: a command assigned at start is the shape that reliably runs.
+        command: []
+        onRunningChanged: {
+            if (running) {
+                lockProbeDeadline.restart();
+            } else {
+                lockProbeDeadline.stop();
+                lockProbeKillGrace.stop();
+            }
+        }
+        onExited: function(code) { root.lockProbeFinished(code, root.lockProbeAnswer) }
+
+        // Read out of the collector here rather than in onExited: with a
+        // process that has already exited, `text` is not reliably still there.
+        stdout: StdioCollector {
+            id: lockProbeOutput
+            waitForEnd: true
+            onStreamFinished: root.lockProbeAnswer = text
+        }
+
+        stderr: StdioCollector {
+            id: lockProbeError
+            waitForEnd: true
+        }
+    }
+
+    Timer {
+        id: lockProbeDeadline
+
+        interval: root.processDeadlineMs
+        onTriggered: {
+            if (lockProbe.running) {
+                lockProbe.signal(15);
+                lockProbeKillGrace.restart();
+            }
+        }
+    }
+
+    Timer {
+        id: lockProbeKillGrace
+
+        interval: root.processKillGraceMs
+        onTriggered: root.stopProcess(lockProbe, lockProbeDeadline, lockProbeKillGrace)
     }
 
     // The state record itself. A failure here is not something the person at
